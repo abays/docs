@@ -96,6 +96,19 @@ oc exec -n openshift-adp ${VELERO_POD} -- /velero version
 
 ## Backup Procedure
 
+### Pre-check: Verify Control Plane Health
+
+Verify that the OpenStack control plane and data plane are Ready before
+taking a backup. A backup of an unhealthy environment might restore into
+the same broken state.
+
+```bash
+oc wait openstackcontrolplane -n openstack --all \
+  --for=condition=Ready --timeout=10s
+oc wait openstackdataplanenodeset -n openstack --all \
+  --for=condition=Ready --timeout=10s
+```
+
 ### Step 1: Collect Operator Version and Backup Timestamp
 
 ```bash

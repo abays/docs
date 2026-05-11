@@ -7,7 +7,8 @@ environments. The backup playbooks and templates are in the
 
 ## Backup Approach
 
-We use a two-backup strategy:
+We use a two-backup strategy, with an optional third backup for
+baremetal-provisioned environments:
 
 1. **PVC backup** — PVCs with CSI snapshots
    - Filters at backup time using `labelSelector`
@@ -21,7 +22,12 @@ We use a two-backup strategy:
    - Excludes PVCs (backed up separately)
    - Includes: CRs, Secrets, ConfigMaps, NADs, etc.
 
-## Why Two Backups?
+3. **BMH backup** (optional) — BaremetalHosts in a separate namespace
+   - Only needed when Metal3 BaremetalHosts are in a different namespace
+     from the OpenStack resources
+   - Includes BaremetalHosts, Secrets, and ConfigMaps
+
+## Why Separate Backups?
 
 - **Flexibility**: Allows selective restore (e.g., restore only PVCs or only CRs)
 - **PVC Filtering**: Only backup PVCs we explicitly labeled (saves storage costs)
@@ -169,7 +175,48 @@ oc wait --for=jsonpath='{.status.phase}'=Completed \
   backup/openstack-backup-resources-${BACKUP_TS} -n openshift-adp --timeout=30m
 ```
 
-### Step 5: Verify
+### Step 5: OADP Baremetal Backup (optional — baremetal-provisioned nodes only)
+
+Skip this step if all OpenStackDataPlaneNodeSets use `preProvisioned: true`.
+
+If your Metal3 BaremetalHosts are in the same namespace as the OpenStack
+resources, they are already captured by the resources backup in Step 4 and
+this step can be skipped.
+
+If your BaremetalHosts are in a different namespace, create an additional
+backup for that namespace. During restore, the BaremetalHosts, secrets, and
+configmaps from this backup are restored in Restore Step 7:
+
+```bash
+BMH_NAMESPACE=<namespace where BaremetalHosts are located>
+BMH_BACKUP=openstack-backup-bmh-${BACKUP_TS}
+
+cat <<EOF | oc apply -f -
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: ${BMH_BACKUP}
+  namespace: openshift-adp
+  annotations:
+    openstack.org/csv-version: "${CSV_VERSION}"
+    openstack.org/catalog-source-image: "${CATALOG_IMG}"
+    openstack.org/operator-image: "${OPERATOR_IMG}"
+spec:
+  includedNamespaces:
+  - ${BMH_NAMESPACE}
+  includedResources:
+  - baremetalhosts.metal3.io
+  - secrets
+  - configmaps
+  storageLocation: velero-1
+  ttl: 720h
+EOF
+
+oc wait --for=jsonpath='{.status.phase}'=Completed \
+  backup/${BMH_BACKUP} -n openshift-adp --timeout=30m
+```
+
+### Step 6: Verify
 
 ```bash
 oc get backup -n openshift-adp -o custom-columns=NAME:.metadata.name,PHASE:.status.phase
@@ -195,6 +242,16 @@ All resources in the namespace except PVCs. This includes CRs, Secrets,
 ConfigMaps, NetworkAttachmentDefinitions, and any other namespace-scoped
 resources. Restore ordering is controlled by `backup.openstack.org/restore-order`
 labels on the backed-up resources (see [`../restore/README.md`](../restore/README.md)).
+
+### backup-openstack-bmh (optional — baremetal-provisioned nodes only)
+
+Metal3 BaremetalHosts and associated Secrets and ConfigMaps (Step 5). This
+backup is only needed when BaremetalHosts are in a different namespace from
+the OpenStack resources. If they are in the same namespace, they are
+captured by the resources backup above.
+
+`OpenStackBaremetalSet` and `OpenStackProvisionServer` resources are in the
+`openstack` namespace and are included in the resources backup.
 
 ## Verification
 

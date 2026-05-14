@@ -205,6 +205,28 @@ spec:
   volumeSnapshotLocations: []              # Use default CSI driver, not a specific VSL
   storageLocation: velero-1                # BackupStorageLocation name
   ttl: 720h                                # Backup retention (30 days)
+  hooks:                                   # Swift xattr backup (optional, see notes)
+    resources:
+      - name: swift-xattr-backup
+        includedNamespaces:
+          - openstack
+        labelSelector:
+          matchLabels:
+            component: swift-storage
+        pre:
+          - exec:
+              container: object-server
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -e
+                  DUMP="/srv/node/pv/.swift-xattrs.dump"
+                  rm -f "\$DUMP" "\${DUMP}.applied" "\${DUMP}.missing"
+                  getfattr -R -d -m user.swift /srv/node/pv/ 1> "\$DUMP"
+                  echo "xattr backup complete: \$(grep -c '^# file:' "\$DUMP") files"
+              onError: Fail
+              timeout: 600s
 EOF
 
 oc wait --for=jsonpath='{.status.phase}'=Completed \
@@ -212,6 +234,18 @@ oc wait --for=jsonpath='{.status.phase}'=Completed \
 ```
 
 **Notes:**
+- The `hooks.resources` section is required when Swift is deployed as part of
+  the control plane. It dumps Swift extended attributes (xattrs) to a file on
+  the PVC before the CSI snapshot. OADP DataMover uses kopia for
+  filesystem-level data transfer, which does not preserve xattrs. Swift stores
+  all object metadata in xattrs — without this hook, all Swift objects become
+  inaccessible after restore. The hook is safe to include even if Swift is not
+  deployed — it only targets pods with `component: swift-storage` and is
+  silently skipped if no matching pods exist. On the restore side, an init
+  container on the Swift storage StatefulSet restores xattrs from the dump
+  before Swift services start. See the
+  [swift-operator backup/restore documentation](https://github.com/openstack-k8s-operators/swift-operator/blob/main/docs/backup-restore-xattrs.md)
+  for details.
 - Remove `snapshotMoveData: true` if you do not want to upload snapshot data
   to the BackupStorageLocation (local CSI snapshots only). Without Data Mover,
   PVC restore requires the original VolumeSnapshotContent to still exist.

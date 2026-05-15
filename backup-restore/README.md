@@ -124,6 +124,7 @@ versions, see [`restore/README.md`](restore/README.md) for workarounds.
 |-----------|-----------|---------------|
 | ControlPlane | OpenStackControlPlane, OpenStackVersion, NADs, Secrets, ConfigMaps, GaleraBackup, Topology, BGPConfiguration, DNSData, InstanceHa, Database contents (Galera dumps), PVCs (Glance, GaleraBackup), RabbitMQ default-user credentials (labeled by infra-operator) | Individual service CRs (recreated by controller), MariaDBDatabase/Account (recreated by operators), Certificate CRs (recreated by operators), Running pods, OVN database contents, RabbitMQ queue data (fresh cluster) |
 | DataPlane | NetConfig, OpenStackDataPlaneNodeSet, OpenStackDataPlaneService, Reservation, IPSet, OpenStackDataPlaneDeployment (backed up but not restored, to avoid triggering new deployments) | — |
+| Baremetal (optional) | Metal3 BaremetalHosts (in BMH namespace), OpenStackBaremetalSet, OpenStackProvisionServer, associated Secrets and ConfigMaps | — |
 
 **ExtraMounts PVCs:** PVCs passed via `extraMounts` (global or per-service)
 are user-managed and **must be labeled manually** for backup/restore. Add
@@ -145,6 +146,7 @@ for the full table.
 | 30 | OpenStackControlPlane | With `deployment-stage: infrastructure-only` |
 | 40 | GaleraBackup, IPSet, DataPlaneService | Backup config and IP sets |
 | 50 | **Manual**: Database restore, resume deployment | Create GaleraRestore CRs, run restore, remove `deployment-stage` annotation |
+| 55 | BaremetalHosts, OpenStackBaremetalSet, OpenStackProvisionServer | Optional: baremetal-provisioned nodes only. Requires resource modifier (BMH pause annotation), operator scale-down, and `restoreStatus` |
 | 60 | OpenStackDataPlaneNodeSet | DataPlane resources (optional) |
 
 ## Features Enabling Backup/Restore
@@ -262,11 +264,20 @@ When restoring DataPlane, the OpenStackDataPlaneDeployment history is lost.
 NodeSets will show `waiting for OpenStackDataPlaneDeployment...` — this is
 a **safe state**; actual dataplane nodes are running correctly.
 
-### Pre-Provisioned Nodes Only
+### Baremetal-Provisioned Nodes
 
-The DataPlane backup/restore procedure is designed for NodeSets with
-`preProvisioned: true`. For nodes provisioned via OpenStackBaremetalSet and
-Metal3, additional procedures are required.
+Nodes provisioned via OpenStackBaremetalSet and Metal3 BaremetalHosts are
+supported with additional backup and restore steps. The restore requires:
+
+- A resource modifier to pause BMHs during restore (prevents Metal3 from
+  reprovisioning)
+- Velero's `restoreStatus` to restore the BMH and OpenStackBaremetalSet
+  status subresources
+- Temporarily scaling down the openstack-baremetal operator and deleting
+  its webhooks during OpenStackBaremetalSet restore (the validating webhook
+  incorrectly rejects the restore because status is not yet set)
+
+See the [user guide](user-guide.md) for the full procedure.
 
 ## See Also
 

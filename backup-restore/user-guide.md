@@ -281,7 +281,53 @@ oc wait --for=jsonpath='{.status.phase}'=Completed \
   backup/openstack-backup-resources-${BACKUP_TS} -n openshift-adp --timeout=30m
 ```
 
-### Step 6: Verify Backup
+### Step 6: OADP Baremetal Backup (optional — baremetal-provisioned nodes only)
+
+Skip this step if all OpenStackDataPlaneNodeSets use `preProvisioned: true`.
+
+If your Metal3 BaremetalHosts are in the same namespace as the OpenStack
+resources, they are already captured by the resources backup in Step 5 and
+this step can be skipped.
+
+If your BaremetalHosts are in a different namespace, create an additional
+backup for that namespace. During restore, the secrets and configmaps from
+this backup — BaremetalHosts, secrets, and configmaps — are restored in
+Restore Step 10:
+
+```bash
+BMH_NAMESPACE=<namespace where BaremetalHosts are located>
+BMH_BACKUP=openstack-backup-bmh-${BACKUP_TS}
+
+cat <<EOF | oc apply -f -
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: ${BMH_BACKUP}
+  namespace: openshift-adp
+  annotations:
+    openstack.org/csv-version: "${CSV_VERSION}"
+    openstack.org/catalog-source-image: "${CATALOG_IMG}"
+    openstack.org/operator-image: "${OPERATOR_IMG}"
+spec:
+  includedNamespaces:
+  - ${BMH_NAMESPACE}
+  includedResources:
+  - baremetalhosts.metal3.io
+  - secrets
+  - configmaps
+  storageLocation: velero-1
+  ttl: 720h
+EOF
+
+oc wait --for=jsonpath='{.status.phase}'=Completed \
+  backup/${BMH_BACKUP} -n openshift-adp --timeout=30m
+```
+
+The `OpenStackBaremetalSet` and `OpenStackProvisionServer` resources are in
+the `openstack` namespace and are already captured by the resources backup
+in Step 5.
+
+### Step 7: Verify Backup
 
 ```bash
 # Check backup status
@@ -344,7 +390,9 @@ Create a Velero Resource Modifier ConfigMap in the OADP namespace
 (`openshift-adp`). This is an OADP/Velero feature that modifies resources
 during restore. The ConfigMap is referenced by all Restore CRs via
 `spec.resourceModifier`. It strips ownerReferences and annotations, adds
-staged deployment to the ControlPlane, and disables InstanceHa during restore.
+staged deployment to the ControlPlane, disables InstanceHa during restore,
+and pauses BaremetalHosts to prevent Metal3 from acting on them before their
+status is restored.
 
 ```bash
 cat <<'EOF' | oc apply -f -
@@ -393,6 +441,15 @@ data:
       - patchData: |
           spec:
             disabled: "True"
+    # Rule 4: BaremetalHosts — pause BMHs during restore so Metal3 does
+    # not act on them before their status is restored.
+    - conditions:
+        groupResource: baremetalhosts.metal3.io
+      mergePatches:
+      - patchData: |
+          metadata:
+            annotations:
+              baremetalhost.metal3.io/paused: ""
 EOF
 ```
 
@@ -448,7 +505,7 @@ oc wait --for=jsonpath='{.status.phase}'=Completed \
   restore/openstack-restore-10-foundation-${RESTORE_SUFFIX} -n openshift-adp --timeout=5m
 ```
 
-Steps 3-6 and 9 follow the same pattern — only the restore order label
+Steps 3-6 follow the same pattern — only the restore order label
 and the Restore CR name change. Each step restores a specific set of
 resources selected by `backup.openstack.org/restore-order`.
 
@@ -652,7 +709,161 @@ oc wait openstackcontrolplane -n openstack --all \
   --for=condition=Ready --timeout=30m
 ```
 
-### Step 10: Restore DataPlane
+### Step 10: Restore BaremetalHosts (optional — baremetal-provisioned nodes only)
+
+Skip this step if all OpenStackDataPlaneNodeSets use `preProvisioned: true`.
+
+Restore Metal3 BaremetalHosts with their status preserved. The resource
+modifier from Step 0 injects a `baremetalhost.metal3.io/paused` annotation
+so that Metal3 does not act on the BMHs before their status is set.
+
+**Namespace considerations:**
+
+- If your BaremetalHosts are in the `openstack` namespace, their secrets
+  and configmaps are already restored in Step 2 (order 10). Skip the
+  secrets/configmaps restore below and only restore the BaremetalHosts.
+  Use `${RESOURCES_BACKUP}` as the `backupName` and set
+  `includedNamespaces` to `openstack`.
+- If your BaremetalHosts are in a **separate namespace**, restore their
+  secrets and configmaps first from the BMH backup (Backup Step 6),
+  then restore the BaremetalHosts themselves.
+
+**Separate namespace only** — restore BMH secrets and configmaps:
+
+```bash
+BMH_NAMESPACE=<namespace where BaremetalHosts are located>
+BMH_BACKUP=openstack-backup-bmh-${BACKUP_TIMESTAMP}
+
+cat <<EOF | oc apply -f -
+apiVersion: velero.io/v1
+kind: Restore
+metadata:
+  name: openstack-restore-bmh-secrets-${RESTORE_SUFFIX}
+  namespace: openshift-adp
+spec:
+  backupName: ${BMH_BACKUP}
+  includedNamespaces:
+  - ${BMH_NAMESPACE}
+  includedResources:
+  - secrets
+  - configmaps
+  resourceModifier:
+    kind: ConfigMap
+    name: openstack-restore-resource-modifiers
+EOF
+
+oc wait --for=jsonpath='{.status.phase}'=Completed \
+  restore/openstack-restore-bmh-secrets-${RESTORE_SUFFIX} -n openshift-adp --timeout=5m
+```
+
+Restore the BaremetalHosts:
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: velero.io/v1
+kind: Restore
+metadata:
+  name: openstack-restore-bmh-${RESTORE_SUFFIX}
+  namespace: openshift-adp
+spec:
+  backupName: ${BMH_BACKUP}
+  includedNamespaces:
+  - ${BMH_NAMESPACE}
+  includedResources:
+  - baremetalhosts.metal3.io
+  restorePVs: false
+  restoreStatus:
+    includedResources:
+    - baremetalhosts.metal3.io
+  resourceModifier:
+    kind: ConfigMap
+    name: openstack-restore-resource-modifiers
+EOF
+
+oc wait --for=jsonpath='{.status.phase}'=Completed \
+  restore/openstack-restore-bmh-${RESTORE_SUFFIX} -n openshift-adp --timeout=10m
+```
+
+After the restore completes, remove the pause annotations so Metal3
+recognizes the BMHs in their restored state. Consider unpausing a
+single BMH first to verify it reaches the expected state before
+unpausing the rest:
+
+```bash
+oc annotate bmh -n ${BMH_NAMESPACE} <single-bmh-name> baremetalhost.metal3.io/paused-
+oc get bmh -n ${BMH_NAMESPACE} <single-bmh-name>
+
+# After confirming the BMH is in the expected state, unpause the rest
+oc annotate bmh -n ${BMH_NAMESPACE} --all baremetalhost.metal3.io/paused-
+```
+
+Verify BMHs are in the expected state:
+
+```bash
+oc get bmh -n ${BMH_NAMESPACE}
+```
+
+All BMHs should show `STATE: provisioned` and `ONLINE: true`.
+
+### Step 11: Restore OpenStackBaremetalSets (optional — baremetal-provisioned nodes only)
+
+Skip this step if all OpenStackDataPlaneNodeSets use `preProvisioned: true`.
+
+The openstack-baremetal operator must be scaled down and its webhooks
+deleted before restoring `OpenStackBaremetalSet` resources. Velero restores
+the spec and status in separate API calls — with an empty status, the
+validating webhook incorrectly determines that new BMH allocations are
+needed and rejects the restore.
+
+Secrets and configmaps are **not** restored here — they are already
+restored in order 10 (Step 2).
+
+```bash
+oc patch -n openstack-operators openstack openstack --type='merge' \
+  -p '{"spec":{"operatorOverrides":[{"name":"openstack-baremetal","replicas":0}]}}'
+
+oc delete mutatingwebhookconfiguration \
+  openstack-baremetal-operator-mutating-webhook-configuration
+oc delete validatingwebhookconfiguration \
+  openstack-baremetal-operator-validating-webhook-configuration
+
+cat <<EOF | oc apply -f -
+apiVersion: velero.io/v1
+kind: Restore
+metadata:
+  name: openstack-restore-55-bmset-${RESTORE_SUFFIX}
+  namespace: openshift-adp
+spec:
+  backupName: ${RESOURCES_BACKUP}
+  includedNamespaces:
+  - openstack
+  includedResources:
+  - openstackbaremetalsets.baremetal.openstack.org
+  - openstackprovisionservers.baremetal.openstack.org
+  restoreStatus:
+    includedResources:
+    - openstackbaremetalsets.baremetal.openstack.org
+  resourceModifier:
+    kind: ConfigMap
+    name: openstack-restore-resource-modifiers
+EOF
+
+oc wait --for=jsonpath='{.status.phase}'=Completed \
+  restore/openstack-restore-55-bmset-${RESTORE_SUFFIX} -n openshift-adp --timeout=10m
+```
+
+Scale the operator back up (this also recreates the webhooks):
+
+```bash
+oc patch -n openstack-operators openstack openstack --type='merge' \
+  -p '{"spec":{"operatorOverrides":[{"name":"openstack-baremetal","replicas":1}]}}'
+```
+
+The `OpenStackBaremetalSet` will temporarily leave the `Ready` state while
+the `OpenStackProvisionServer` reconciles, but the associated BMHs remain
+untouched and their workloads are unaffected.
+
+### Step 12: Restore DataPlane
 
 ```bash
 cat <<EOF | oc apply -f -
@@ -678,7 +889,7 @@ oc wait --for=jsonpath='{.status.phase}'=Completed \
   restore/openstack-restore-60-dataplane-${RESTORE_SUFFIX} -n openshift-adp --timeout=5m
 ```
 
-### Step 11: EDPM Deployment
+### Step 13: EDPM Deployment
 
 Resync deployment/configuration state from restored backup on dataplane nodes:
 
@@ -699,7 +910,7 @@ EOF
 fi
 ```
 
-### Step 12: Verify and Sync Neutron to OVN
+### Step 14: Verify and Sync Neutron to OVN
 
 If OVN database backups were not taken (Backup Steps 3 and 8 skipped), the OVN
 databases are empty after restore. The EDPM deployment reconnects
@@ -734,7 +945,7 @@ oc rsh -n openstack -c neutron-api deploy/neutron \
   --ovn-neutron_sync_mode=repair --debug
 ```
 
-### Step 13: Re-enable InstanceHa (optional)
+### Step 15: Re-enable InstanceHa (optional)
 
 Only required if InstanceHa was used in the backed-up environment.
 After verifying the restored cloud is fully operational (see [Verification](#verification)):
@@ -847,4 +1058,9 @@ oc annotate secret custom-ca-cert -n openstack \
   placement.
 - **Fully updated environments only** — backup/restore is not supported for
   partial update states
+- **Baremetal operator scale-down required** — restoring `OpenStackBaremetalSet`
+  resources requires temporarily scaling down the openstack-baremetal operator
+  and deleting its webhooks (Steps 9b/9c). The validating webhook rejects
+  the restore because Velero sets the status in a separate API call after
+  creating the resource
 

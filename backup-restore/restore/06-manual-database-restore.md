@@ -32,7 +32,7 @@ cat <<EOF | oc apply -f -
 apiVersion: mariadb.openstack.org/v1beta1
 kind: GaleraRestore
 metadata:
-  name: openstackrestore
+  name: openstack
   namespace: openstack
 spec:
   backupSource: openstack
@@ -43,7 +43,7 @@ cat <<EOF | oc apply -f -
 apiVersion: mariadb.openstack.org/v1beta1
 kind: GaleraRestore
 metadata:
-  name: openstackrestorecell1
+  name: openstack-cell1
   namespace: openstack
 spec:
   backupSource: openstack-cell1
@@ -52,30 +52,19 @@ EOF
 
 ### 3. Wait for restore pods to be ready
 
-The mariadb-operator will create restore pods. The pod name follows the
-pattern `<backupSource>-restore-<restoreName>`:
+The mariadb-operator will create restore pods. You can identify all restore
+pods using the `galerarestore/name` label:
 
 ```bash
-oc get pods -n openstack | grep restore
-# Expected pods:
-#   openstack-restore-openstackrestore        (main cell)
-#   openstack-cell1-restore-openstackrestorecell1  (cell1, if multi-cell)
-```
-
-Wait for pods to be in `Running` state:
-
-```bash
-oc wait --for=jsonpath='{.status.phase}'=Running \
-  pod/openstack-restore-openstackrestore -n openstack --timeout=5m
-
-# Cell1 (if multi-cell):
-oc wait --for=jsonpath='{.status.phase}'=Running \
-  pod/openstack-cell1-restore-openstackrestorecell1 -n openstack --timeout=5m
+oc get pod -l galerarestore/name -n openstack
+NAME                      READY   STATUS    RESTARTS   AGE
+restore-openstack         1/1     Running   0          5m
+restore-openstack-cell1   1/1     Running   0          5m
 ```
 
 ### 4. Verify backup files exist
 
-List the backup dump files matching your backup timestamp on the restore pod.
+List the backup dump files matching your backup timestamp on each restore pod.
 Replace `<BACKUP_TIMESTAMP>` with the timestamp used during backup
 (e.g., `20260311-081234`):
 
@@ -83,11 +72,11 @@ Replace `<BACKUP_TIMESTAMP>` with the timestamp used during backup
 BACKUP_TIMESTAMP=<BACKUP_TIMESTAMP>
 
 # Main cell
-oc exec -n openstack openstack-restore-openstackrestore -- \
+oc exec -n openstack restore-openstack -- \
   ls -1 /backup/data/*_${BACKUP_TIMESTAMP}.sql.gz
 
 # Cell1 (if multi-cell)
-oc exec -n openstack openstack-cell1-restore-openstackrestorecell1 -- \
+oc exec -n openstack restore-openstack-cell1 -- \
   ls -1 /backup/data/*_${BACKUP_TIMESTAMP}.sql.gz
 ```
 
@@ -104,12 +93,14 @@ recreated by the operators:
 BACKUP_TIMESTAMP=<BACKUP_TIMESTAMP>
 
 # Main cell
-oc exec -n openstack openstack-restore-openstackrestore -- \
-  /var/lib/backup-scripts/restore_galera --yes --content data "/backup/data/*_${BACKUP_TIMESTAMP}.sql.gz"
+oc exec -n openstack restore-openstack -- \
+  /var/lib/backup-scripts/restore_galera --yes --content data \
+  "/backup/data/*_${BACKUP_TIMESTAMP}.sql.gz"
 
 # Cell1 (if multi-cell)
-oc exec -n openstack openstack-cell1-restore-openstackrestorecell1 -- \
-  /var/lib/backup-scripts/restore_galera --yes --content data "/backup/data/*_${BACKUP_TIMESTAMP}.sql.gz"
+oc exec -n openstack restore-openstack-cell1 -- \
+  /var/lib/backup-scripts/restore_galera --yes --content data \
+  "/backup/data/*_${BACKUP_TIMESTAMP}.sql.gz"
 ```
 
 ### 6. Verify database restore
@@ -124,9 +115,9 @@ oc exec -it galera-0 -n openstack -- mysql -e "SHOW DATABASES;"
 Delete the GaleraRestore CRs to terminate the restore pods:
 
 ```bash
-oc delete galerarestore openstackrestore -n openstack
+oc delete galerarestore openstack -n openstack
 # Cell1 (if multi-cell):
-oc delete galerarestore openstackrestorecell1 -n openstack
+oc delete galerarestore openstack-cell1 -n openstack
 ```
 
 ## Next Steps

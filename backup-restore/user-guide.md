@@ -613,7 +613,7 @@ cat <<EOF | oc apply -f -
 apiVersion: mariadb.openstack.org/v1beta1
 kind: GaleraRestore
 metadata:
-  name: openstackrestore
+  name: openstack
   namespace: openstack
 spec:
   backupSource: openstack
@@ -625,27 +625,36 @@ EOF
 # apiVersion: mariadb.openstack.org/v1beta1
 # kind: GaleraRestore
 # metadata:
-#   name: openstackrestorecell1
+#   name: openstack-cell1
 #   namespace: openstack
 # spec:
 #   backupSource: openstack-cell1
 # EOF
 ```
 
-Wait for restore pod to be ready, then execute the restore.
-The pod name follows the pattern `{galera-instance}-restore-{restore-cr-name}`:
+Wait for restore pods to be ready. You can identify all restore pods using
+the `galerarestore/name` label:
 
 ```bash
-# Wait for restore pod
-oc wait pod/openstack-restore-openstackrestore -n openstack \
-  --for=condition=Ready --timeout=5m
-
-# Execute restore (use --content data to restore only data, not grants)
-oc exec -n openstack openstack-restore-openstackrestore -- \
-  /var/lib/backup-scripts/restore_galera --yes --content data "/backup/data/*_${BACKUP_TS}.sql.gz"
+oc get pod -l galerarestore/name -n openstack
+NAME                      READY   STATUS    RESTARTS   AGE
+restore-openstack         1/1     Running   0          5m
+restore-openstack-cell1   1/1     Running   0          5m
 ```
 
-Repeat for additional cells if needed (e.g. `openstack-cell1-restore-openstackrestorecell1`).
+Execute the restore on each pod (use `--content data` to restore only data,
+not grants):
+
+```bash
+oc exec -n openstack restore-openstack -- \
+  /var/lib/backup-scripts/restore_galera --yes --content data \
+  "/backup/data/*_${BACKUP_TS}.sql.gz"
+
+# Repeat for additional cells, e.g.:
+# oc exec -n openstack restore-openstack-cell1 -- \
+#   /var/lib/backup-scripts/restore_galera --yes --content data \
+#   "/backup/data/*_${BACKUP_TS}.sql.gz"
+```
 
 Clean up GaleraRestore CRs:
 

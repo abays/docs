@@ -19,7 +19,7 @@ before starting the next.
 | 30 | OpenStackControlPlane, Reservation | **Restored with `deployment-stage: infrastructure-only` annotation** |
 | 40 | GaleraBackup, IPSet, DataPlaneService | Backup config, IP sets, custom DataPlane services |
 | 50 | **Manual**: Database restore | Create GaleraRestore CRs, restore databases, remove deployment-stage annotation |
-| 55 | BaremetalHosts (Step 7), OpenStackBaremetalSet (Step 8) | Optional: baremetal-provisioned nodes only. BMH secrets/CMs restored here if separate namespace. Requires BMH pause annotation (resource modifier), operator scale-down, and `restoreStatus` |
+| 55 | BaremetalHosts (Step 7), OpenStackBaremetalSet (Step 8) | Optional: baremetal-provisioned nodes only. BMH secrets/CMs restored here if separate namespace. Requires BMH pause annotation, OSBMS webhook-skip and pause annotations (resource modifier), and `restoreStatus` |
 | 60 | OpenStackDataPlaneNodeSet | DataPlane resources (optional) |
 | - | OpenStackDataPlaneDeployment | Resync credentials on dataplane nodes |
 | - | **Manual** | Re-enable InstanceHa (`spec.disabled: False`) after verifying the cloud is operational |
@@ -147,8 +147,6 @@ data:
     resourceModifierRules:
     - conditions:
         groupResource: "*"
-        namespaces:
-        - openstack
       mergePatches:
       - patchData: |
           metadata:
@@ -157,8 +155,6 @@ data:
               kubectl.kubernetes.io/last-applied-configuration: null
     - conditions:
         groupResource: openstackcontrolplanes.core.openstack.org
-        namespaces:
-        - openstack
       mergePatches:
       - patchData: |
           metadata:
@@ -167,8 +163,6 @@ data:
               core.openstack.org/deployment-stage: "infrastructure-only"
     - conditions:
         groupResource: instancehas.instanceha.openstack.org
-        namespaces:
-        - openstack
       mergePatches:
       - patchData: |
           spec:
@@ -182,6 +176,19 @@ data:
           metadata:
             annotations:
               baremetalhost.metal3.io/paused: ""
+    # OpenStackBaremetalSets — skip webhook validation and pause
+    # reconciliation during restore. Velero restores spec and status in
+    # separate API calls; the webhook rejects the restore because the
+    # status is initially empty, and the reconciler would act on
+    # incomplete state before the status is set.
+    - conditions:
+        groupResource: openstackbaremetalsets.baremetal.openstack.org
+      mergePatches:
+      - patchData: |
+          metadata:
+            annotations:
+              openstack.org/skip-webhook-validation: ""
+              openstack.org/paused: ""
 EOF
 ```
 
@@ -455,22 +462,20 @@ oc get bmh -n ${BMH_NAMESPACE}
 
 Skip this step if all OpenStackDataPlaneNodeSets use `preProvisioned: true`.
 
-Scale down the openstack-baremetal operator and delete its webhooks.
-Velero restores spec and status in separate API calls — the validating
-webhook rejects the restore because the status is initially empty.
+The resource modifier from Step 0 injects two annotations on
+`OpenStackBaremetalSet` resources during restore:
+
+- `openstack.org/skip-webhook-validation` — bypasses webhook validation.
+  Velero restores spec and status in separate API calls; the webhook
+  rejects the restore because the status is initially empty.
+- `openstack.org/paused` — pauses operator reconciliation. Without this,
+  the operator would act on the incomplete resource state before Velero
+  restores the status.
 
 Secrets and configmaps are **not** restored here — they are already
 restored in order 10 (Step 2).
 
 ```bash
-oc patch -n openstack-operators openstack openstack --type='merge' \
-  -p '{"spec":{"operatorOverrides":[{"name":"openstack-baremetal","replicas":0}]}}'
-
-oc delete mutatingwebhookconfiguration \
-  openstack-baremetal-operator-mutating-webhook-configuration
-oc delete validatingwebhookconfiguration \
-  openstack-baremetal-operator-validating-webhook-configuration
-
 cat <<EOF | oc apply -f -
 apiVersion: velero.io/v1
 kind: Restore
@@ -496,11 +501,13 @@ oc wait --for=jsonpath='{.status.phase}'=Completed \
   restore/openstack-restore-55-bmset-${RESTORE_SUFFIX} -n openshift-adp --timeout=10m
 ```
 
-Scale the operator back up (recreates webhooks automatically):
+Remove the annotations to allow webhook validation and operator
+reconciliation to resume:
 
 ```bash
-oc patch -n openstack-operators openstack openstack --type='merge' \
-  -p '{"spec":{"operatorOverrides":[{"name":"openstack-baremetal","replicas":1}]}}'
+oc annotate openstackbaremetalset --all -n openstack \
+  openstack.org/skip-webhook-validation- \
+  openstack.org/paused-
 ```
 
 The `OpenStackBaremetalSet` will temporarily leave `Ready` state while

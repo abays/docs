@@ -410,8 +410,6 @@ data:
     # last-applied-configuration annotation (can be too large for etcd)
     - conditions:
         groupResource: "*"
-        namespaces:
-        - openstack
       mergePatches:
       - patchData: |
           metadata:
@@ -423,8 +421,6 @@ data:
     # Databases are restored before removing the annotation in Step 9.
     - conditions:
         groupResource: openstackcontrolplanes.core.openstack.org
-        namespaces:
-        - openstack
       mergePatches:
       - patchData: |
           metadata:
@@ -435,8 +431,6 @@ data:
     # false positives while infrastructure is coming up.
     - conditions:
         groupResource: instancehas.instanceha.openstack.org
-        namespaces:
-        - openstack
       mergePatches:
       - patchData: |
           spec:
@@ -450,6 +444,19 @@ data:
           metadata:
             annotations:
               baremetalhost.metal3.io/paused: ""
+    # Rule 5: OpenStackBaremetalSets — skip webhook validation and pause
+    # reconciliation during restore. Velero restores spec and status in
+    # separate API calls; the webhook rejects the restore because the
+    # status is initially empty, and the reconciler would act on
+    # incomplete state before the status is set.
+    - conditions:
+        groupResource: openstackbaremetalsets.baremetal.openstack.org
+      mergePatches:
+      - patchData: |
+          metadata:
+            annotations:
+              openstack.org/skip-webhook-validation: ""
+              openstack.org/paused: ""
 EOF
 ```
 
@@ -818,24 +825,20 @@ All BMHs should show `STATE: provisioned` and `ONLINE: true`.
 
 Skip this step if all OpenStackDataPlaneNodeSets use `preProvisioned: true`.
 
-The openstack-baremetal operator must be scaled down and its webhooks
-deleted before restoring `OpenStackBaremetalSet` resources. Velero restores
-the spec and status in separate API calls — with an empty status, the
-validating webhook incorrectly determines that new BMH allocations are
-needed and rejects the restore.
+The resource modifier from Step 0 injects two annotations on
+`OpenStackBaremetalSet` resources during restore:
+
+- `openstack.org/skip-webhook-validation` — bypasses webhook validation.
+  Velero restores spec and status in separate API calls; the webhook
+  rejects the restore because the status is initially empty.
+- `openstack.org/paused` — pauses operator reconciliation. Without this,
+  the operator would act on the incomplete resource state before Velero
+  restores the status.
 
 Secrets and configmaps are **not** restored here — they are already
 restored in order 10 (Step 2).
 
 ```bash
-oc patch -n openstack-operators openstack openstack --type='merge' \
-  -p '{"spec":{"operatorOverrides":[{"name":"openstack-baremetal","replicas":0}]}}'
-
-oc delete mutatingwebhookconfiguration \
-  openstack-baremetal-operator-mutating-webhook-configuration
-oc delete validatingwebhookconfiguration \
-  openstack-baremetal-operator-validating-webhook-configuration
-
 cat <<EOF | oc apply -f -
 apiVersion: velero.io/v1
 kind: Restore
@@ -861,11 +864,13 @@ oc wait --for=jsonpath='{.status.phase}'=Completed \
   restore/openstack-restore-55-bmset-${RESTORE_SUFFIX} -n openshift-adp --timeout=10m
 ```
 
-Scale the operator back up (this also recreates the webhooks):
+Remove the annotations to allow webhook validation and operator
+reconciliation to resume:
 
 ```bash
-oc patch -n openstack-operators openstack openstack --type='merge' \
-  -p '{"spec":{"operatorOverrides":[{"name":"openstack-baremetal","replicas":1}]}}'
+oc annotate openstackbaremetalset --all -n openstack \
+  openstack.org/skip-webhook-validation- \
+  openstack.org/paused-
 ```
 
 The `OpenStackBaremetalSet` will temporarily leave the `Ready` state while
@@ -1067,9 +1072,9 @@ oc annotate secret custom-ca-cert -n openstack \
   placement.
 - **Fully updated environments only** — backup/restore is not supported for
   partial update states
-- **Baremetal operator scale-down required** — restoring `OpenStackBaremetalSet`
-  resources requires temporarily scaling down the openstack-baremetal operator
-  and deleting its webhooks (Steps 9b/9c). The validating webhook rejects
-  the restore because Velero sets the status in a separate API call after
-  creating the resource
+- **OpenStackBaremetalSet restore annotations** — restoring `OpenStackBaremetalSet`
+  resources requires the `openstack.org/skip-webhook-validation` and
+  `openstack.org/paused` annotations (injected by the resource modifier in
+  Step 0). These annotations must be manually removed after restore (Step 11)
+  to re-enable webhook validation and operator reconciliation
 

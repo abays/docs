@@ -208,8 +208,6 @@ spec:
   hooks:                                   # Swift xattr backup (optional, see notes)
     resources:
       - name: swift-xattr-backup
-        includedNamespaces:
-          - openstack
         labelSelector:
           matchLabels:
             component: swift-storage
